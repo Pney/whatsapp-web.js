@@ -448,13 +448,9 @@ class Message extends Base {
         }
 
         const result = await this.client.pupPage.evaluate(async (msgId) => {
-<<<<<<< HEAD
-            const msg = window.Store.Msg.get(msgId) || (await window.Store.Msg.getMessagesById([msgId]))?.messages?.[0];
-=======
             const msg = (window.require('WAWebCollections')).Msg.get(msgId) || (await (window.require('WAWebCollections')).Msg.getMessagesById([msgId]))?.messages?.[0];
 
             // REUPLOADING mediaStage means the media is expired and the download button is spinning, cannot be downloaded now
->>>>>>> 883d7e4eda036fe461e21df88db65ae16ea7241c
             if (!msg || !msg.mediaData || msg.mediaData.mediaStage === 'REUPLOADING') {
                 return null;
             }
@@ -476,11 +472,7 @@ class Message extends Base {
                     addAnnotations: function() { return this; },
                     addPoint: function() { return this; }
                 };
-<<<<<<< HEAD
-                const decryptedMedia = await window.Store.DownloadManager.downloadAndMaybeDecrypt({
-=======
                 const decryptedMedia = await (window.require('WAWebDownloadManager').downloadManager).downloadAndMaybeDecrypt({
->>>>>>> 883d7e4eda036fe461e21df88db65ae16ea7241c
                     directPath: msg.directPath,
                     encFilehash: msg.encFilehash,
                     filehash: msg.filehash,
