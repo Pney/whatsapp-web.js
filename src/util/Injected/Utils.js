@@ -582,8 +582,18 @@ exports.LoadUtils = () => {
 
         return window
             .require('WAWebCollections')
-            .Msg.get(newMsgKey._serialized);
+            .Msg.get(window.WWebJS.getMsgKeyId(newMsgKey));
     };
+
+    /**
+     * Serialized id of a message key, tolerating WhatsApp Web having renamed
+     * the key's `_serialized` property to `$1` (WA Web 2.3000.104xxx+).
+     * Reading the old name now returns undefined, which reaches IndexedDB as
+     * `.get(undefined)` and throws "Failed to execute 'get' on
+     * 'IDBObjectStore': No key or key range specified." Chat ids are
+     * unaffected by the rename, only message-key-like objects are.
+     */
+    window.WWebJS.getMsgKeyId = (key) => key?._serialized ?? key?.$1 ?? undefined;
 
     window.WWebJS.editMessage = async (msg, content, options = {}) => {
         const extraOptions = options.extraOptions || {};
@@ -625,7 +635,9 @@ exports.LoadUtils = () => {
         await window
             .require('WAWebSendMessageEditAction')
             .sendMessageEdit(msg, content, internalOptions);
-        return window.require('WAWebCollections').Msg.get(msg.id._serialized);
+        return window
+            .require('WAWebCollections')
+            .Msg.get(window.WWebJS.getMsgKeyId(msg.id));
     };
 
     window.WWebJS.toStickerData = async (mediaInfo) => {
@@ -834,6 +846,18 @@ exports.LoadUtils = () => {
             });
         }
 
+        // WA Web renamed msg.id._serialized to msg.id.$1; restore it so every
+        // consumer of message.id._serialized (this library's own Message
+        // structure included) keeps working without knowing about $1.
+        if (typeof msg.id === 'object' && msg.id._serialized == null) {
+            const serializedId = window.WWebJS.getMsgKeyId(msg.id);
+            if (serializedId) {
+                msg.id = Object.assign({}, msg.id, {
+                    _serialized: serializedId,
+                });
+            }
+        }
+
         delete msg.pendingAckUpdate;
 
         return msg;
@@ -957,7 +981,13 @@ exports.LoadUtils = () => {
             const groupMetadata =
                 window.require('WAWebCollections').GroupMetadata ||
                 window.require('WAWebCollections').WAWebGroupMetadataCollection;
-            await groupMetadata.update(chatWid);
+            try {
+                await groupMetadata.update(chatWid);
+            } catch {
+                // Chats com id baseado em LID podem não ser encontrados no
+                // IndexedDB local ainda; retorna o chat sem group metadata
+                // em vez de derrubar o getChatById inteiro.
+            }
             const { toPn } = window.require('WAWebLidMigrationUtils');
             const serializedMetadata = chat.groupMetadata.serialize();
             for (const p of serializedMetadata.participants || []) {
@@ -981,16 +1011,21 @@ exports.LoadUtils = () => {
 
         model.lastMessage = null;
         if (model.msgs && model.msgs.length) {
-            const lastMessage = chat.lastReceivedKey
+            // chat.lastReceivedKey é um message key: sofre o rename
+            // _serialized -> $1 do WA Web. Sem o fallback, o Msg.get abaixo
+            // recebe undefined e o IndexedDB lança "No key or key range
+            // specified" — foi exatamente esse erro que quebrou getChatById.
+            const lastReceivedKeyId = window.WWebJS.getMsgKeyId(
+                chat.lastReceivedKey,
+            );
+            const lastMessage = lastReceivedKeyId
                 ? window
                       .require('WAWebCollections')
-                      .Msg.get(chat.lastReceivedKey._serialized) ||
+                      .Msg.get(lastReceivedKeyId) ||
                   (
                       await window
                           .require('WAWebCollections')
-                          .Msg.getMessagesById([
-                              chat.lastReceivedKey._serialized,
-                          ])
+                          .Msg.getMessagesById([lastReceivedKeyId])
                   )?.messages?.[0]
                 : null;
             lastMessage &&
@@ -1103,6 +1138,107 @@ exports.LoadUtils = () => {
             type: mimetype,
             lastModified: Date.now(),
         });
+    };
+
+    /**
+     * Resolves the media blob and metadata for a message.
+     * Shared by downloadMedia and downloadMediaStream.
+     * @param {string} msgId
+     * @returns {Promise<{blob: Blob, mimetype: string, filename: string, filesize: number}|null>}
+     */
+    window.WWebJS.resolveMediaBlob = async (msgId) => {
+        const { Msg } = window.require('WAWebCollections');
+        const msg =
+            Msg.get(msgId) ||
+            (await Msg.getMessagesById([msgId]))?.messages?.[0];
+
+        if (
+            !msg ||
+            !msg.mediaData ||
+            msg.mediaData.mediaStage === 'REUPLOADING'
+        ) {
+            return null;
+        }
+
+        // msg.downloadMedia({rmrReason: 1, ...}) (método novo, introduzido em
+        // 2026-06) está retornando 400 do servidor pra vídeo. Tentamos o
+        // método antigo primeiro, direto na CDN com as chaves que já vêm na
+        // própria mensagem (não depende de nenhum fetch prévio), e só
+        // chamamos o método novo se esse não funcionar - pra não arriscar
+        // que a chamada nova mexa/invalide directPath/mediaKey antes da gente
+        // usar eles no método antigo.
+        let blob;
+        try {
+            const mockQpl = {
+                addAnnotations: function () {
+                    return this;
+                },
+                addPoint: function () {
+                    return this;
+                },
+            };
+            const decryptedMedia = await window
+                .require('WAWebDownloadManager')
+                .downloadManager.downloadAndMaybeDecrypt({
+                    directPath: msg.directPath,
+                    encFilehash: msg.encFilehash,
+                    filehash: msg.filehash,
+                    mediaKey: msg.mediaKey,
+                    mediaKeyTimestamp: msg.mediaKeyTimestamp,
+                    type: msg.type,
+                    signal: new AbortController().signal,
+                    downloadQpl: mockQpl,
+                });
+            if (decryptedMedia) {
+                blob = new Blob([decryptedMedia], {
+                    type: msg.mimetype || 'application/octet-stream',
+                });
+            }
+        } catch (e) {
+            if (!(e.status && e.status === 404)) {
+                console.error(
+                    '[wwebjs] downloadAndMaybeDecrypt (fallback direto) falhou:',
+                    e && e.message,
+                );
+            }
+        }
+
+        if (!blob) {
+            // Always call internal downloadMedia - never skip based on
+            // mediaStage, because cache eviction can leave stage=RESOLVED
+            // with empty InMemoryMediaBlobCache.
+            await msg.downloadMedia({
+                downloadEvenIfExpensive: true,
+                rmrReason: 1,
+                isUserInitiated: true,
+            });
+
+            if (
+                msg.mediaData.mediaStage.includes('ERROR') ||
+                msg.mediaData.mediaStage === 'FETCHING'
+            ) {
+                return null;
+            }
+
+            const cached = window
+                .require('WAWebMediaInMemoryBlobCache')
+                ?.InMemoryMediaBlobCache?.get(msg.mediaObject?.filehash);
+
+            if (cached) {
+                blob = cached;
+            } else if (msg.mediaObject?.mediaBlob?.forceToBlob) {
+                blob = msg.mediaObject.mediaBlob.forceToBlob();
+            }
+        }
+
+        if (!blob) return null;
+
+        return {
+            blob,
+            mimetype: msg.mimetype,
+            filename: msg.filename,
+            filesize: msg.size,
+        };
     };
 
     window.WWebJS.arrayBufferToBase64 = (arrayBuffer) => {
